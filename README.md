@@ -1,8 +1,20 @@
-# Finding a needle in a haystack
-Finding New Worlds！
+(Note: Please try to run it on Linux/Unix.)
 
-This is a multi-threaded Bitcoin private key search program that uses CPU multi-threaded calculations to generate and verify random private keys, and searches in a random manner. This program can be used to test the collision probability of Bitcoin addresses or related research. (Note: Please try to run it on Linux.)
+# High-Performance Bitcoin Private Key Collider in Rust
 
+This is a high-speed Bitcoin private key search tool engineered in Rust. Designed to maximize the computational throughput of modern multi-core CPUs, this program generates private keys via brute-force or random entropy and checks them against a target dataset of Bitcoin addresses.
+
+Key Features:
+
+Extreme Performance: Built on the optimized secp256k1 library, leveraging SIMD (AVX2) and SHA hardware instruction sets to maximize hash rates.
+
+Massive Parallelism: Automatically detects CPU topology to launch multi-threaded workers, fully utilizing 100% of available resources on AMD Ryzen and Intel Core processors.
+
+Memory Efficiency: Implements Bloom Filters to handle massive target lists (target_addresses.tsv) with minimal memory footprint, ensuring ultra-fast O(1) lookups.
+
+IO-Free Logic: Operates purely in-memory after initialization to eliminate disk I/O bottlenecks.
+
+Disclaimer: This tool is strictly for cryptographic research and educational purposes. Do not use for illegal activities.
 
 ## RUST(This version is recommended.)
 <img src="image/rust1.png" alt="" width="400">
@@ -15,6 +27,9 @@ This is a multi-threaded Bitcoin private key search program that uses CPU multi-
     #Let the compiler generate the most optimized instruction set (e.g., AVX2, AVX-512, etc.) for the CPU you are using, which can improve stability.
     RUSTFLAGS="-C target-cpu=native" cargo run --release -- --target-file BTC_Puzzle_Address_71.tsv --output-file found.tsv --threads 8 --range 400000000000000000:7fffffffffffffffff
 
+    --help
+        Print help
+
 
 ## Support me!
 
@@ -26,7 +41,7 @@ This is a multi-threaded Bitcoin private key search program that uses CPU multi-
     
     LTzSaAtCvAhjRYJHSFPjmqustpYRCypXxL
     
-### (USDT、USDC)
+    USDT、USDC:
     
     TRC20:
     TXdmK7Dd5UjWbfutoiHDGLBub4hYjbWteg
@@ -37,6 +52,7 @@ This is a multi-threaded Bitcoin private key search program that uses CPU multi-
     Aptos：
     0x3f7d7a503dcd26915d93af18f3deaf7108a29b7e517e627782882d313835f00b
     
+
 
 
 
