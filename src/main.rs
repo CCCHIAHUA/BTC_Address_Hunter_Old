@@ -1,11 +1,13 @@
-// main.rs - 修复熵更新与多线程协调版本
+// main.rs - 优化版本（实施优化1和2）
+// 优化1: 使用可复用的HashContext避免重复创建Hasher
+// 优化2: 使用固定数组[u8; 20]避免堆分配
 
 use secp256k1::{Secp256k1, SecretKey, PublicKey};
 use sha2::{Sha256, Digest};
 use ripemd::{Ripemd160, Digest as RipemdDigest};
 use bs58;
-use rand::{RngCore, SeedableRng}; // 引入 SeedableRng
-use rand::rngs::StdRng; // 引入 StdRng 以便手动控制种子
+use rand::{RngCore, SeedableRng};
+use rand::rngs::StdRng;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
@@ -19,7 +21,7 @@ use std::collections::HashSet;
 use rayon::prelude::*;
 use indicatif::{ProgressBar, ProgressStyle};
 use bloomfilter::Bloom;
-use num_bigint::{BigUint, ToBigUint};
+use num_bigint::BigUint;
 use num_traits::identities::Zero;
 use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
@@ -34,8 +36,29 @@ const CURVE_ORDER: [u8; 32] = [
 const P2PKH_VERSION: u8 = 0x00;
 const ADDRESS_LENGTH: usize = 25;
 const CHECKSUM_LENGTH: usize = 4;
-const RESEED_INTERVAL_SECS: u64 = 1 * 60; // 1分钟
-const STOP_CHECK_INTERVAL: usize = 4000; // 每4000次检查一次停止标志
+const STOP_CHECK_INTERVAL: usize = 4000;
+
+// 优化1: 可复用的哈希上下文结构体
+struct HashContext {
+    sha256: Sha256,
+    ripemd160: Ripemd160,
+}
+
+impl HashContext {
+    fn new() -> Self {
+        Self {
+            sha256: Sha256::new(),
+            ripemd160: Ripemd160::new(),
+        }
+    }
+    
+    fn reset(&mut self) {
+        use sha2::digest::Reset as Sha2Reset;
+        use ripemd::digest::Reset as RipemdReset;
+        Sha2Reset::reset(&mut self.sha256);
+        RipemdReset::reset(&mut self.ripemd160);
+    }
+}
 
 #[derive(Parser, Clone)]
 #[command(author, version, about = "一个用于从文件中搜索目标P2PKH地址的比特币私钥查找器")]
@@ -100,7 +123,8 @@ fn parse_range(range: &str, curve_order: &BigUint) -> Result<(BigUint, BigUint),
     Ok((start, end))
 }
 
-fn is_valid_p2pkh_address(address: &str) -> Option<Vec<u8>> {
+// 优化2: 返回固定数组而非Vec
+fn is_valid_p2pkh_address(address: &str) -> Option<[u8; 20]> {
     let decoded = bs58::decode(address).into_vec().ok()?;
     if decoded.len() != ADDRESS_LENGTH || decoded[0] != P2PKH_VERSION {
         return None;
@@ -118,13 +142,16 @@ fn is_valid_p2pkh_address(address: &str) -> Option<Vec<u8>> {
     
     let calculated_checksum = &sha256_2[..CHECKSUM_LENGTH];
     if checksum == calculated_checksum {
-        Some(decoded[1..21].to_vec())
+        let mut result = [0u8; 20];
+        result.copy_from_slice(&decoded[1..21]);
+        Some(result)
     } else {
         None
     }
 }
 
-fn load_targets(file_path: &str) -> Result<(HashSet<Vec<u8>>, HashSet<String>, Bloom<Vec<u8>>), String> {
+// 优化2: 修改返回类型为HashSet<[u8; 20]>和Bloom<[u8; 20]>
+fn load_targets(file_path: &str) -> Result<(HashSet<[u8; 20]>, HashSet<String>, Bloom<[u8; 20]>), String> {
     let start_time = Instant::now();
     let file = File::open(file_path).map_err(|e| format!("无法打开目标文件: {}", e))?;
     let reader = BufReader::new(file);
@@ -160,7 +187,7 @@ fn load_targets(file_path: &str) -> Result<(HashSet<Vec<u8>>, HashSet<String>, B
     let mut bloom = Bloom::new_for_fp_rate(valid_count.max(1) as usize, 0.001)
         .map_err(|e| format!("无法创建Bloom filter: {:?}", e))?;
     
-    let results: Vec<(Vec<u8>, String)> = lines.par_iter()
+    let results: Vec<([u8; 20], String)> = lines.par_iter()
         .filter_map(|address| {
             let address = address.trim();
             is_valid_p2pkh_address(address).map(|ripemd160| (ripemd160, address.to_string()))
@@ -183,33 +210,43 @@ fn load_targets(file_path: &str) -> Result<(HashSet<Vec<u8>>, HashSet<String>, B
     Ok((ripemd160_set, address_set, bloom))
 }
 
-fn generate_address_from_pubkey(public_key: &PublicKey) -> (Vec<u8>, String) {
+// 优化1和2: 使用HashContext并返回固定数组
+fn generate_address_from_pubkey(public_key: &PublicKey, ctx: &mut HashContext) -> ([u8; 20], String) {
+    // 重置哈希上下文以复用
+    ctx.reset();
+    
     let pubkey_bytes = public_key.serialize();
     
-    let mut sha256 = Sha256::new();
-    sha256.update(&pubkey_bytes);
-    let sha256_result = sha256.finalize();
+    // SHA256(公钥)
+    ctx.sha256.update(&pubkey_bytes);
+    let sha256_result = ctx.sha256.finalize_reset();
     
-    let mut ripemd160 = Ripemd160::new();
-    ripemd160.update(&sha256_result);
-    let ripemd160_result = ripemd160.finalize();
+    // RIPEMD160(SHA256结果)
+    ctx.ripemd160.update(&sha256_result);
+    let ripemd160_result = ctx.ripemd160.finalize_reset();
     
+    // 构建扩展的RIPEMD160（版本 + RIPEMD160 + 校验和）
     let mut extended_ripemd160 = [0u8; ADDRESS_LENGTH];
     extended_ripemd160[0] = P2PKH_VERSION;
     extended_ripemd160[1..21].copy_from_slice(&ripemd160_result);
     
-    sha256 = Sha256::new();
-    sha256.update(&extended_ripemd160[..21]);
-    let sha256_1 = sha256.finalize();
+    // 计算校验和：SHA256(SHA256(版本+RIPEMD160))
+    ctx.sha256.update(&extended_ripemd160[..21]);
+    let sha256_1 = ctx.sha256.finalize_reset();
     
-    sha256 = Sha256::new();
-    sha256.update(&sha256_1);
-    let sha256_2 = sha256.finalize();
+    ctx.sha256.update(&sha256_1);
+    let sha256_2 = ctx.sha256.finalize_reset();
     
     extended_ripemd160[21..ADDRESS_LENGTH].copy_from_slice(&sha256_2[..CHECKSUM_LENGTH]);
     
+    // Base58编码
     let address = bs58::encode(&extended_ripemd160).into_string();
-    (ripemd160_result.to_vec(), address)
+    
+    // 返回固定数组而非Vec
+    let mut ripemd160_array = [0u8; 20];
+    ripemd160_array.copy_from_slice(&ripemd160_result);
+    
+    (ripemd160_array, address)
 }
 
 fn save_result(private_key_bytes: &[u8], public_key_bytes: &[u8], address: &str, output_file: &str) -> io::Result<()> {
@@ -221,83 +258,81 @@ fn save_result(private_key_bytes: &[u8], public_key_bytes: &[u8], address: &str,
     )
 }
 
-fn biguint_to_32_bytes(b: &BigUint) -> [u8; 32] {
-    let mut bytes = [0u8; 32];
-    let biguint_bytes = b.to_bytes_be();
-    if biguint_bytes.len() > 32 {
-        panic!("BigUint太大，无法放入32字节数组");
-    }
-    let offset = 32 - biguint_bytes.len();
-    bytes[offset..].copy_from_slice(&biguint_bytes);
-    bytes
-}
-
-fn get_physical_cores() -> usize {
-    let mut sys = System::new();
+fn validate_cores(cores: Option<usize>) -> usize {
+    let mut sys = System::new_all();
+    sys.refresh_cpu_all();
+    std::thread::sleep(std::time::Duration::from_millis(200));
     sys.refresh_cpu_all();
     
     let physical_cores = sys.physical_core_count().unwrap_or_else(|| {
-        let logical_cores = num_cpus::get();
-        (logical_cores / 2).max(1)
+        let logical = num_cpus::get();
+        (logical + 1) / 2
     });
+
+    let cores = cores.unwrap_or(physical_cores);
+    let max_cores = physical_cores;
     
-    physical_cores
+    if cores > max_cores {
+        println!("警告: 请求的核心数 ({}) 超过了物理核心数 ({})，将使用 {} 核心", 
+            cores, max_cores, max_cores);
+        max_cores
+    } else {
+        cores
+    }
 }
 
-fn validate_cores(requested_cores: Option<usize>) -> usize {
-    let physical_cores = get_physical_cores();
-    let logical_cores = num_cpus::get();
-    
-    println!("系统信息：物理核心 {} 个，逻辑线程 {} 个", physical_cores, logical_cores);
-    
-    match requested_cores {
-        Some(cores) => {
-            if cores == 0 {
-                eprintln!("错误：核心数不能为 0，将使用物理核心数（{}）", physical_cores);
-                physical_cores
-            } else if cores > physical_cores {
-                eprintln!("警告：请求的核心数 ({}) 超过物理核心数 ({})，已自动调整为 {}", 
-                    cores, physical_cores, physical_cores);
-                physical_cores
-            } else {
-                cores
-            }
-        },
-        None => {
-            println!("未指定核心数，将使用所有物理核心（{}）", physical_cores);
-            physical_cores
+fn bigint_to_bytes_32(n: &BigUint) -> [u8; 32] {
+    let bytes = n.to_bytes_be();
+    let mut result = [0u8; 32];
+    let start = 32 - bytes.len();
+    result[start..].copy_from_slice(&bytes);
+    result
+}
+
+fn increment_bytes_32(bytes: &mut [u8; 32]) {
+    for i in (0..32).rev() {
+        if bytes[i] == 0xFF {
+            bytes[i] = 0;
+        } else {
+            bytes[i] += 1;
+            break;
         }
     }
 }
 
-// 修复后的范围搜索
+fn is_within_range(current: &[u8; 32], end: &[u8; 32]) -> bool {
+    current <= end
+}
+
+// 修改函数签名：使用[u8; 20]而非Vec<u8>
 fn search_range(
-    args: Args,
-    ripemd160_set: Arc<HashSet<Vec<u8>>>,
-    _address_set: Arc<HashSet<String>>,
-    bloom: Arc<Bloom<Vec<u8>>>,
-    total_checked: Arc<AtomicU64>,
+    args: Args, 
+    ripemd160_set: Arc<HashSet<[u8; 20]>>, 
+    _address_set: Arc<HashSet<String>>, 
+    bloom: Arc<Bloom<[u8; 20]>>, 
+    total_checked: Arc<AtomicU64>, 
     stop: Arc<AtomicBool>,
     test_file_tx: Option<Sender<String>>,
-    global_reseed_events: Arc<AtomicU64>, // 仅用于统计
 ) {
-    let range_str = args.range.as_ref().expect("需要指定范围");
-    let curve_order = BigUint::from_bytes_be(&CURVE_ORDER);
-    let (start, end) = match parse_range(range_str, &curve_order) {
+    let range_str = args.range.clone().unwrap();
+    let curve_order = BigUint::parse_bytes(hex::encode(CURVE_ORDER).as_bytes(), 16).unwrap();
+    let (start, end) = match parse_range(&range_str, &curve_order) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("解析范围时出错: {}", e);
+            eprintln!("范围解析错误: {}", e);
             std::process::exit(1);
         }
     };
     
-    println!("在范围内随机搜索: {} 到 {}", 
-        start.to_str_radix(16).to_uppercase(),
+    let num_cores = validate_cores(args.cores);
+    println!("正在使用 {} 个物理核心在范围 {} 到 {} 内搜索...", num_cores, 
+        start.to_str_radix(16).to_uppercase(), 
         end.to_str_radix(16).to_uppercase());
     
     let range_size = &end - &start + 1u32;
-    let num_cores = validate_cores(args.cores);
-    println!("正在使用 {} 个物理核心启动范围搜索...", num_cores);
+    let chunk_size = (&range_size / num_cores) + 1u32;
+    let start_arc = Arc::new(start);
+    let end_arc = Arc::new(end);
     
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_cores)
@@ -306,40 +341,28 @@ fn search_range(
         .install(|| {
             (0..num_cores).into_par_iter().for_each(|thread_id| {
                 let secp = Secp256k1::new();
-                
-                // 显式使用 StdRng 并从 OS 获取种子
-                let mut rng = StdRng::from_os_rng();
-                
+                // 优化1: 创建可复用的HashContext
+                let mut hash_ctx = HashContext::new();
+
+                let thread_start = &*start_arc + &chunk_size * thread_id;
+                let thread_end_calc = &thread_start + &chunk_size - 1u32;
+                let thread_end = if thread_end_calc > *end_arc {
+                    (*end_arc).clone()
+                } else {
+                    thread_end_calc
+                };
+
+                if thread_start > *end_arc {
+                    return;
+                }
+
+                let mut privkey_bytes = bigint_to_bytes_32(&thread_start);
+                let end_bytes = bigint_to_bytes_32(&thread_end);
                 let thread_tx = test_file_tx.clone();
-                let reseed_interval = Duration::from_secs(RESEED_INTERVAL_SECS);
-                
-                // 线程本地计时器，不依赖全局锁
-                let mut next_reseed_time = Instant::now() + reseed_interval;
-                
                 let mut iteration = 0usize;
-                
-                while !stop.load(Ordering::Relaxed) {
-                    // 定期检查时间（每4000次循环检查一次，减少系统调用）
+
+                while !stop.load(Ordering::Relaxed) && is_within_range(&privkey_bytes, &end_bytes) {
                     if iteration % STOP_CHECK_INTERVAL == 0 {
-                        if Instant::now() >= next_reseed_time {
-                            // 时间到，重新从 OS 获取种子
-                            std::thread::sleep(Duration::from_micros(thread_id as u64 * 50)); // 轻微错开避免瞬间IO拥堵
-                            rng = StdRng::from_os_rng(); 
-                            
-                            // 更新下一次重置时间
-                            next_reseed_time = Instant::now() + reseed_interval;
-                            
-                            // 更新全局计数并判断是否打印日志
-                            let total_events = global_reseed_events.fetch_add(1, Ordering::Relaxed) + 1;
-                            
-                            // 关键修复：使用取模运算 (%) 而不是等于 (==)
-                            // 这样无论核心数是多少，每当累计次数达到核心数的倍数时，就代表“一轮”完成了
-                            if total_events % (num_cores as u64) == 0 {
-                                let rounds = total_events / (num_cores as u64);
-                                println!("\n所有核心已重新获取熵！总轮次: {}", rounds);
-                            }
-                        }
-                        
                         if stop.load(Ordering::Relaxed) {
                             break;
                         }
@@ -347,22 +370,17 @@ fn search_range(
                     
                     iteration += 1;
                     
-                    let offset = range_size.to_biguint().and_then(|r| {
-                        let mut random_bytes = [0u8; 32];
-                        rng.fill_bytes(&mut random_bytes);
-                        Some(BigUint::from_bytes_be(&random_bytes) % &r)
-                    }).unwrap_or_else(|| 0u32.into());
-                    
-                    let privkey_biguint = &start + offset;
-                    let privkey_bytes = biguint_to_32_bytes(&privkey_biguint);
-                    
                     let secret_key = match SecretKey::from_byte_array(privkey_bytes) {
                         Ok(key) => key,
-                        Err(_) => continue,
+                        Err(_) => {
+                            increment_bytes_32(&mut privkey_bytes);
+                            continue;
+                        }
                     };
                     
                     let public_key = PublicKey::from_secret_key(&secp, &secret_key);
-                    let (ripemd160, address) = generate_address_from_pubkey(&public_key);
+                    // 优化1和2: 使用HashContext和固定数组
+                    let (ripemd160, address) = generate_address_from_pubkey(&public_key, &mut hash_ctx);
                     
                     if let Some(tx) = &thread_tx {
                         let pubkey_bytes = public_key.serialize();
@@ -386,22 +404,22 @@ fn search_range(
                         }
                     }
                     
+                    increment_bytes_32(&mut privkey_bytes);
                     total_checked.fetch_add(1, Ordering::Relaxed);
                 }
             });
         });
 }
 
-// 修复后的全随机搜索
+// 修改函数签名：删除未使用的 global_reseed_events 参数
 fn search_random(
     args: Args, 
-    ripemd160_set: Arc<HashSet<Vec<u8>>>, 
+    ripemd160_set: Arc<HashSet<[u8; 20]>>, 
     _address_set: Arc<HashSet<String>>, 
-    bloom: Arc<Bloom<Vec<u8>>>, 
+    bloom: Arc<Bloom<[u8; 20]>>, 
     total_checked: Arc<AtomicU64>, 
     stop: Arc<AtomicBool>,
     test_file_tx: Option<Sender<String>>,
-    global_reseed_events: Arc<AtomicU64>,
 ) {
     let num_cores = validate_cores(args.cores);
     println!("正在使用 {} 个物理核心启动全范围随机搜索...", num_cores);
@@ -411,44 +429,17 @@ fn search_random(
         .build()
         .unwrap()
         .install(|| {
-            (0..num_cores).into_par_iter().for_each(|thread_id| {
+            (0..num_cores).into_par_iter().for_each(|_thread_id| {
                 let secp = Secp256k1::new();
-                
-                // 显式使用 StdRng 并从 OS 获取种子
+                // 优化1: 创建可复用的HashContext
+                let mut hash_ctx = HashContext::new();
+                // 每个线程初始化一次RNG即可，无需定期重置
                 let mut rng = StdRng::from_os_rng();
 
                 let mut privkey_bytes = [0u8; 32];
                 let thread_tx = test_file_tx.clone();
-                let reseed_interval = Duration::from_secs(RESEED_INTERVAL_SECS);
-                
-                let mut next_reseed_time = Instant::now() + reseed_interval;
-                
-                let mut iteration = 0usize;
                 
                 while !stop.load(Ordering::Relaxed) {
-                    if iteration % STOP_CHECK_INTERVAL == 0 {
-                        if Instant::now() >= next_reseed_time {
-                             // 重新获取熵
-                            std::thread::sleep(Duration::from_micros(thread_id as u64 * 50));
-                            rng = StdRng::from_os_rng();
-                            next_reseed_time = Instant::now() + reseed_interval;
-                            
-                            let total_events = global_reseed_events.fetch_add(1, Ordering::Relaxed) + 1;
-                            
-                            // 修复后的逻辑
-                            if total_events % (num_cores as u64) == 0 {
-                                let rounds = total_events / (num_cores as u64);
-                                println!("\n所有核心已重新获取熵！总轮次: {}", rounds);
-                            }
-                        }
-                        
-                        if stop.load(Ordering::Relaxed) {
-                            break;
-                        }
-                    }
-                    
-                    iteration += 1;
-                    
                     rng.fill_bytes(&mut privkey_bytes);
                     
                     let secret_key = match SecretKey::from_byte_array(privkey_bytes) {
@@ -457,7 +448,8 @@ fn search_random(
                     };
                     
                     let public_key = PublicKey::from_secret_key(&secp, &secret_key);
-                    let (ripemd160, address) = generate_address_from_pubkey(&public_key);
+                    // 优化1和2: 使用HashContext和固定数组
+                    let (ripemd160, address) = generate_address_from_pubkey(&public_key, &mut hash_ctx);
                     
                     if let Some(tx) = &thread_tx {
                         let pubkey_bytes = public_key.serialize();
@@ -506,9 +498,7 @@ fn main() {
     
     let total_checked = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
-    let global_reseed_events = Arc::new(AtomicU64::new(0));
     
-    // 进度显示线程
     let progress_stop = stop.clone();
     let progress_checked = total_checked.clone();
     let progress_thread = std::thread::spawn(move || {
@@ -572,13 +562,12 @@ fn main() {
         }));
     }
 
-    // 核心调用更改，移除了不必要的参数
     if args.range.is_some() {
-        println!("正在指定范围内进行【随机】搜索...");
-        search_range(args, ripemd160_set_arc, address_set_arc, bloom_arc, total_checked.clone(), stop.clone(), test_file_tx, global_reseed_events.clone());
+        println!("正在指定范围内进行【顺序】搜索...");
+        search_range(args, ripemd160_set_arc, address_set_arc, bloom_arc, total_checked.clone(), stop.clone(), test_file_tx);
     } else {
         println!("正在全范围（随机）搜索私钥...");
-        search_random(args, ripemd160_set_arc, address_set_arc, bloom_arc, total_checked.clone(), stop.clone(), test_file_tx, global_reseed_events.clone());
+        search_random(args, ripemd160_set_arc, address_set_arc, bloom_arc, total_checked.clone(), stop.clone(), test_file_tx);
     }
     
     stop.store(true, Ordering::SeqCst);
@@ -595,13 +584,6 @@ fn main() {
     let speed = if elapsed > 0.0 { checked as f64 / elapsed } else { 0.0 };
     
     println!("\n\n搜索完成。");
-    
-    // 计算并打印总重置次数
-    let final_reseed_events = global_reseed_events.load(Ordering::SeqCst);
-    // 这里我们无法确切知道使用了多少核心（因为在 search 函数内部定义），
-    // 但可以简单打印总事件数，或者粗略估算。
-    println!("总计触发熵更新事件: {} 次 (所有核心累计)", final_reseed_events);
-
     println!("已检查密钥总数: {}", format_with_commas(checked));
     println!("平均速度: {} keys/s", format_float_with_commas(speed));
     println!("总耗时: {:.2} 秒", elapsed);
