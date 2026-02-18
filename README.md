@@ -6,6 +6,8 @@ This is a high-speed Bitcoin private key search tool engineered in Rust. Designe
 
 Key Features:
 
+Replicates the private key generation process of the Bitcoin Core wallet. It utilizes OS-level strong entropy (CSPRNG) mixed with SHA-256 for seed initialization and generates independent cryptographic-grade random streams via the ChaCha12 algorithm.
+
 Extreme Performance: Built on the optimized secp256k1 library, leveraging SIMD (AVX2) and SHA hardware instruction sets to maximize hash rates.
 
 Massive Parallelism: Automatically detects CPU topology to launch multi-threaded workers, fully utilizing 100% of available resources on AMD Ryzen and Intel Core processors.
@@ -52,6 +54,7 @@ Disclaimer: This tool is strictly for cryptographic research and educational pur
     Aptos：
     0x3f7d7a503dcd26915d93af18f3deaf7108a29b7e517e627782882d313835f00b
     
+
 
 
 
