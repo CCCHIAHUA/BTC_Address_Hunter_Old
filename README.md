@@ -4,7 +4,7 @@
 
 This is a high-speed Bitcoin private key search tool engineered in Rust. Designed to maximize the computational throughput of modern multi-core CPUs, this program generates private keys via brute-force or random entropy and checks them against a target dataset of Bitcoin addresses.
 
-Key Features:
+### Key Features:
 
 Replicates the private key generation process of the Bitcoin Core wallet. It utilizes OS-level strong entropy (CSPRNG) mixed with SHA-256 for seed initialization and generates independent cryptographic-grade random streams via the ChaCha12 algorithm.
 
@@ -54,6 +54,7 @@ Disclaimer: This tool is strictly for cryptographic research and educational pur
     Aptos：
     0x3f7d7a503dcd26915d93af18f3deaf7108a29b7e517e627782882d313835f00b
     
+
 
 
 
